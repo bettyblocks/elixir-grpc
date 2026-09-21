@@ -123,8 +123,16 @@ defmodule GRPC.Client.Adapters.MintTest do
   end
 
   describe "handle_errors_receive_data/2" do
-    test "returns UNAVAILABLE when the connection is gone" do
-      stream = build(:client_stream, payload: %{response: {:error, :closed}})
+    setup do
+      {:ok, stream_response_pid} =
+        GRPC.Client.Adapters.Mint.StreamResponseProcess.start_link(build(:client_stream), true)
+
+      %{stream_response_pid: stream_response_pid}
+    end
+
+    test "returns UNAVAILABLE when the connection is gone", %{stream_response_pid: pid} do
+      stream =
+        build(:client_stream, payload: %{response: {:error, :closed}, stream_response_pid: pid})
 
       assert {:error, %GRPC.RPCError{status: status, message: message}} =
                Mint.handle_errors_receive_data(stream, [])
@@ -133,9 +141,11 @@ defmodule GRPC.Client.Adapters.MintTest do
       assert message == "the connection is closed"
     end
 
-    test "returns UNAVAILABLE for a transport error" do
+    test "returns UNAVAILABLE for a transport error", %{stream_response_pid: pid} do
       error = %TransportError{reason: :econnrefused}
-      stream = build(:client_stream, payload: %{response: {:error, error}})
+
+      stream =
+        build(:client_stream, payload: %{response: {:error, error}, stream_response_pid: pid})
 
       assert {:error, %GRPC.RPCError{status: status, message: message}} =
                Mint.handle_errors_receive_data(stream, [])
@@ -144,13 +154,14 @@ defmodule GRPC.Client.Adapters.MintTest do
       assert message == Exception.message(error)
     end
 
-    test "returns UNAVAILABLE when the server closed the connection" do
+    test "returns UNAVAILABLE when the server closed the connection", %{stream_response_pid: pid} do
       error = %HTTPError{
         module: Elixir.Mint.HTTP2,
         reason: {:server_closed_connection, :no_error, "shutting down"}
       }
 
-      stream = build(:client_stream, payload: %{response: {:error, error}})
+      stream =
+        build(:client_stream, payload: %{response: {:error, error}, stream_response_pid: pid})
 
       assert {:error, %GRPC.RPCError{status: status, message: message}} =
                Mint.handle_errors_receive_data(stream, [])
@@ -159,40 +170,33 @@ defmodule GRPC.Client.Adapters.MintTest do
       assert message == Exception.message(error)
     end
 
-    test "passes an existing GRPC.RPCError through untouched" do
+    test "passes an existing GRPC.RPCError through untouched", %{stream_response_pid: pid} do
       error = GRPC.RPCError.exception(GRPC.Status.unavailable(), "the connection is closed")
-      stream = build(:client_stream, payload: %{response: {:error, error}})
+
+      stream =
+        build(:client_stream, payload: %{response: {:error, error}, stream_response_pid: pid})
 
       assert {:error, ^error} = Mint.handle_errors_receive_data(stream, [])
     end
 
-    test "returns UNKNOWN for a reason it cannot classify" do
+    test "returns UNKNOWN for a reason it cannot classify", %{stream_response_pid: pid} do
       response = {:error, :something_else}
-      stream = build(:client_stream, payload: %{response: response})
+      stream = build(:client_stream, payload: %{response: response, stream_response_pid: pid})
 
       assert {:error, %GRPC.RPCError{status: status, message: message}} =
                Mint.handle_errors_receive_data(stream, [])
 
       assert status == GRPC.Status.unknown()
-      assert message == "error occurred while receiving data: #{inspect(payload.response)}"
-
-      refute Process.alive?(stream_response_pid)
+      assert message == "error occurred while receiving data: #{inspect(response)}"
     end
 
-    test "returns a GRPC.RPCError with unknown status and stops the stream response process" do
-      {:ok, stream_response_pid} =
-        GRPC.Client.Adapters.Mint.StreamResponseProcess.start_link(build(:client_stream), true)
+    test "stops the stream response process", %{stream_response_pid: pid} do
+      stream =
+        build(:client_stream, payload: %{response: {:error, :closed}, stream_response_pid: pid})
 
-      payload = %{response: {:error, :closed}, stream_response_pid: stream_response_pid}
-      stream = build(:client_stream, payload: payload)
+      assert {:error, %GRPC.RPCError{}} = Mint.handle_errors_receive_data(stream, [])
 
-      assert {:error, %GRPC.RPCError{status: status, message: message}} =
-               Mint.handle_errors_receive_data(stream, [])
-
-      assert status == GRPC.Status.unknown()
-      assert message == "error occurred while receiving data: #{inspect(payload.response)}"
-
-      refute Process.alive?(stream_response_pid)
+      refute Process.alive?(pid)
     end
   end
 

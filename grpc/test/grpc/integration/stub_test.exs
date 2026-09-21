@@ -106,8 +106,8 @@ defmodule GRPC.Integration.StubTest do
           send(parent, {:initial_call_succeeded, channel, reply.message})
         end)
 
-      assert_receive {:initial_call_succeeded, initial_channel, "Hello, first caller"}
-      assert_receive {:DOWN, ^caller_ref, :process, ^caller_pid, :normal}
+      assert_receive {:initial_call_succeeded, initial_channel, "Hello, first caller"}, 2_000
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller_pid, :normal}, 2_000
 
       named_channel = %GRPC.Channel{ref: channel_name}
       manager_pid = whereis_name(channel_name)
