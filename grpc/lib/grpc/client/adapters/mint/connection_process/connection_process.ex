@@ -19,7 +19,14 @@ if Code.ensure_loaded?(Mint.HTTP) do
                                GRPC.Status.unavailable(),
                                "the connection is closed"
                              )
+    # A GOAWAY tells us which requests the server never started; those are
+    # safe to retry, so they fail as UNAVAILABLE rather than with Mint's error.
+    @unprocessed_error GRPC.RPCError.exception(
+                         GRPC.Status.unavailable(),
+                         "the request was not processed before the server closed the connection"
+                       )
     @stream_response_dead_event [:grpc, :client, :mint, :stream_response, :dead]
+    @goaway_event [:grpc, :client, :mint, :goaway]
     @reconnect_stop_event [:grpc, :client, :mint, :reconnect, :stop]
     @reconnect_error_event [:grpc, :client, :mint, :reconnect, :error]
     @reconnect_exhausted_event [:grpc, :client, :mint, :reconnect, :exhausted]
@@ -106,7 +113,8 @@ if Code.ensure_loaded?(Mint.HTTP) do
     def handle_call(:disconnect, _from, state) do
       # TODO add a code to if disconnect is brutal we just  stop if is friendly we wait for pending requests
       {:ok, conn} = Mint.HTTP.close(state.conn)
-      {:stop, :normal, :ok, State.update_conn(state, conn)}
+      Enum.each(state.draining, fn {_id, draining_conn} -> Mint.HTTP.close(draining_conn) end)
+      {:stop, :normal, :ok, %{State.update_conn(state, conn) | draining: %{}}}
     end
 
     def handle_call(_request, _from, %{conn: %Mint.HTTP2{state: :closed}} = state) do
@@ -129,7 +137,7 @@ if Code.ensure_loaded?(Mint.HTTP) do
 
         {:error, conn, reason} ->
           new_state = State.update_conn(state, conn)
-          {:reply, {:error, reason}, new_state}
+          {:reply, {:error, request_error(reason)}, new_state}
       end
     end
 
@@ -153,7 +161,7 @@ if Code.ensure_loaded?(Mint.HTTP) do
 
         {:error, conn, reason} ->
           new_state = State.update_conn(state, conn)
-          {:reply, {:error, reason}, new_state}
+          {:reply, {:error, request_error(reason)}, new_state}
       end
     end
 
@@ -176,11 +184,15 @@ if Code.ensure_loaded?(Mint.HTTP) do
 
     def handle_call({:cancel_request, request_ref}, _from, state)
         when State.has_request_ref(state, request_ref) do
+      conn_id = State.conn_id(state, request_ref)
       state = process_response({:done, request_ref}, state)
 
-      case Mint.HTTP2.cancel_request(state.conn, request_ref) do
-        {:ok, conn} -> {:reply, :ok, State.update_conn(state, conn)}
-        {:error, conn, error} -> {:reply, {:error, error}, State.update_conn(state, conn)}
+      case Mint.HTTP2.cancel_request(conn_for(state, conn_id), request_ref) do
+        {:ok, conn} ->
+          {:reply, :ok, state |> put_conn(conn_id, conn) |> close_if_drained(conn_id)}
+
+        {:error, conn, error} ->
+          {:reply, {:error, error}, state |> put_conn(conn_id, conn) |> close_if_drained(conn_id)}
       end
     end
 
@@ -196,28 +208,50 @@ if Code.ensure_loaded?(Mint.HTTP) do
     def handle_info(message, state) do
       case Mint.HTTP.stream(state.conn, message) do
         :unknown ->
+          stream_draining(message, state)
+
+        {:ok, conn, responses} ->
+          state
+          |> State.update_conn(conn)
+          |> process_responses(responses)
+          |> check_connection_status()
+
+        {:error, conn, _error, responses} ->
+          state
+          |> State.update_conn(conn)
+          |> process_responses(responses)
+          |> check_connection_status()
+      end
+    end
+
+    # A message that is not for the active connection may be for one that is
+    # still draining after a GOAWAY.
+    defp stream_draining(message, state) do
+      found =
+        Enum.find_value(state.draining, fn {id, conn} ->
+          case Mint.HTTP.stream(conn, message) do
+            :unknown -> nil
+            {:ok, conn, responses} -> {id, conn, responses}
+            {:error, conn, _error, responses} -> {id, conn, responses}
+          end
+        end)
+
+      case found do
+        nil ->
           Logger.debug(fn -> "Received unknown message: " <> inspect(message) end)
           {:noreply, state}
 
-        {:ok, conn, responses} ->
-          state = State.update_conn(state, conn)
-
-          state =
-            case state.requests do
-              requests when map_size(requests) == 0 ->
-                state
-
-              _ ->
-                Enum.reduce(responses, state, &process_response/2)
-            end
-
-          check_connection_status(state)
-
-        {:error, conn, _error, _responses} ->
-          state = State.update_conn(state, conn)
-          check_connection_status(state)
+        {id, conn, responses} ->
+          state
+          |> put_conn(id, conn)
+          |> process_responses(responses)
+          |> close_if_drained(id)
+          |> check_request_stream_queue()
       end
     end
+
+    defp process_responses(state, responses),
+      do: Enum.reduce(responses, state, &process_response/2)
 
     @impl true
     def handle_continue(:process_request_stream_queue, state) do
@@ -282,7 +316,7 @@ if Code.ensure_loaded?(Mint.HTTP) do
     defp process_response({:error, request_ref, reason}, state) do
       state
       |> State.stream_response_pid(request_ref)
-      |> end_stream_response(reason)
+      |> end_stream_response(stream_error(reason))
 
       drop_request(state, request_ref)
     end
@@ -315,11 +349,12 @@ if Code.ensure_loaded?(Mint.HTTP) do
         reason: reason
       })
 
+      conn_id = State.conn_id(state, request_ref)
       state = drop_request(state, request_ref)
 
-      case Mint.HTTP2.cancel_request(state.conn, request_ref) do
-        {:ok, conn} -> State.update_conn(state, conn)
-        {:error, conn, _error} -> State.update_conn(state, conn)
+      case Mint.HTTP2.cancel_request(conn_for(state, conn_id), request_ref) do
+        {:ok, conn} -> put_conn(state, conn_id, conn)
+        {:error, conn, _error} -> put_conn(state, conn_id, conn)
       end
     end
 
@@ -450,16 +485,35 @@ if Code.ensure_loaded?(Mint.HTTP) do
           new_state
         end)
 
-      new_state.requests
-      |> Enum.each(fn {ref, _} ->
+      # Requests still draining on a connection retired by a GOAWAY are not
+      # affected: their connection is a different one.
+      clean_state =
         new_state
+        |> fail_requests(State.refs_on(new_state, :active), @connection_closed_error)
+        |> State.update_request_stream_queue(:queue.new())
+
+      maybe_attempt_reconnect(%{clean_state | draining_in_place: false})
+    end
+
+    defp fail_requests(state, refs, error) do
+      Enum.reduce(refs, state, fn ref, acc ->
+        acc
         |> State.stream_response_pid(ref)
-        |> end_stream_response(@connection_closed_error)
+        |> end_stream_response(error)
+
+        {_request, acc} = State.pop_ref(acc, ref)
+        acc
       end)
+    end
 
-      clean_state = State.update_request_stream_queue(%{new_state | requests: %{}}, :queue.new())
-
-      maybe_attempt_reconnect(clean_state)
+    # The process is about to stop: nothing will deliver the answers of the
+    # requests still draining, so fail them instead of leaving callers waiting.
+    defp fail_draining(state) do
+      Enum.reduce(state.draining, state, fn {id, conn}, acc ->
+        Mint.HTTP.close(conn)
+        fail_requests(acc, State.refs_on(acc, id), @connection_closed_error)
+      end)
+      |> Map.put(:draining, %{})
     end
 
     defp end_stream_response(pid, error) do
@@ -469,7 +523,7 @@ if Code.ensure_loaded?(Mint.HTTP) do
 
     defp maybe_attempt_reconnect(%{retry: 0} = state) do
       send(state.parent, {:elixir_grpc, :connection_down, self()})
-      {:stop, :normal, state}
+      {:stop, :normal, fail_draining(state)}
     end
 
     defp maybe_attempt_reconnect(%{retry_attempt: attempt} = state)
@@ -485,7 +539,7 @@ if Code.ensure_loaded?(Mint.HTTP) do
       )
 
       send(state.parent, {:elixir_grpc, :connection_down, self()})
-      {:stop, :normal, state}
+      {:stop, :normal, fail_draining(state)}
     end
 
     defp maybe_attempt_reconnect(state) do
@@ -551,11 +605,120 @@ if Code.ensure_loaded?(Mint.HTTP) do
     end
 
     defp check_connection_status(state) do
-      if Mint.HTTP.open?(state.conn) do
-        check_request_stream_queue(state)
-      else
-        finish_all_pending_requests(state)
+      cond do
+        Mint.HTTP.open?(state.conn, :write) ->
+          check_request_stream_queue(state)
+
+        # Readable but not writable: the server sent a GOAWAY. It still answers
+        # the requests it accepted, it just takes no new ones on this connection.
+        Mint.HTTP.open?(state.conn, :read) ->
+          handle_goaway(state)
+
+        true ->
+          finish_all_pending_requests(state)
       end
     end
+
+    # A replacement was already tried for this GOAWAY and failed: keep
+    # draining; the regular reconnect runs once the server closes the socket.
+    defp handle_goaway(%{draining_in_place: true} = state), do: check_request_stream_queue(state)
+
+    # Open a new connection for new requests right away and let the retired
+    # one finish the requests in flight on it. This is a planned handover by
+    # the server (e.g. grpc-go's MaxConnectionAge), not a failure, so it
+    # happens regardless of the :retry setting and does not use its backoff.
+    defp handle_goaway(state) do
+      {:goaway, error_code, _debug_data} = state.conn.state
+      in_flight = State.refs_on(state, :active)
+
+      case Mint.HTTP.connect(state.scheme, state.host, state.port, state.connect_opts) do
+        {:ok, new_conn} ->
+          emit_goaway(state, length(in_flight), error_code, true)
+          id = make_ref()
+
+          state
+          # Request bodies still queued can no longer be sent on the old
+          # connection, so the server will never answer those requests.
+          |> fail_requests(queued_refs(state, in_flight), @connection_closed_error)
+          |> then(&drop_queued_chunks(&1, in_flight))
+          |> then(&State.move_requests(&1, State.refs_on(&1, :active), id))
+          |> Map.update!(:draining, &Map.put(&1, id, state.conn))
+          |> State.update_conn(new_conn)
+          |> close_if_drained(id)
+          |> check_request_stream_queue()
+
+        {:error, reason} ->
+          Logger.warning(
+            "Server at #{state.scheme}://#{state.host}:#{state.port} is closing the connection " <>
+              "and opening a new one failed: #{inspect(reason)}; finishing the requests in flight first"
+          )
+
+          emit_goaway(state, length(in_flight), error_code, false)
+          check_request_stream_queue(%{state | draining_in_place: true})
+      end
+    end
+
+    defp queued_refs(state, refs) do
+      queued =
+        for {ref, _body, _from} <- :queue.to_list(state.request_stream_queue),
+            into: MapSet.new(),
+            do: ref
+
+      Enum.filter(refs, &MapSet.member?(queued, &1))
+    end
+
+    defp drop_queued_chunks(state, refs) do
+      Enum.reduce(refs, state, &drop_queued_request_chunks(&2, &1))
+    end
+
+    # Once a draining connection has no requests left, or the server closed
+    # it, close it and fail whatever was still waiting on it.
+    defp close_if_drained(state, :active), do: state
+
+    defp close_if_drained(state, id) do
+      case Map.fetch(state.draining, id) do
+        :error ->
+          state
+
+        {:ok, conn} ->
+          refs = State.refs_on(state, id)
+
+          if refs == [] or not Mint.HTTP.open?(conn, :read) do
+            Mint.HTTP.close(conn)
+
+            state
+            |> fail_requests(refs, @connection_closed_error)
+            |> Map.update!(:draining, &Map.delete(&1, id))
+          else
+            state
+          end
+      end
+    end
+
+    defp emit_goaway(state, in_flight, error_code, reconnected) do
+      :telemetry.execute(@goaway_event, %{in_flight: in_flight}, %{
+        scheme: state.scheme,
+        host: state.host,
+        port: state.port,
+        error_code: error_code,
+        reconnected: reconnected
+      })
+    end
+
+    defp conn_for(state, :active), do: state.conn
+    defp conn_for(state, id), do: Map.fetch!(state.draining, id)
+
+    defp put_conn(state, :active, conn), do: State.update_conn(state, conn)
+    defp put_conn(state, id, conn), do: put_in(state.draining[id], conn)
+
+    defp stream_error(%Mint.HTTPError{reason: :unprocessed}), do: @unprocessed_error
+    defp stream_error(reason), do: reason
+
+    # Starting a request on a connection the server is closing.
+    defp request_error(%Mint.HTTPError{reason: reason})
+         when reason in [:closed, :closed_for_writing],
+         do: @connection_closed_error
+
+    defp request_error(reason), do: reason
   end
 end
