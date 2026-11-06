@@ -85,7 +85,8 @@ defmodule GRPC.Client.Adapters.Mint.ConnectionProcessTest do
       assert %{
                stream_response_pid: self(),
                done: false,
-               response: %{}
+               response: %{},
+               conn_id: :active
              } == new_state.requests[request_ref]
 
       assert state.conn != new_state.conn
@@ -143,7 +144,8 @@ defmodule GRPC.Client.Adapters.Mint.ConnectionProcessTest do
       assert %{
                stream_response_pid: self(),
                done: false,
-               response: %{}
+               response: %{},
+               conn_id: :active
              } == new_state.requests[request_ref]
 
       assert {[{request_ref, body, nil}], []} == new_state.request_stream_queue
@@ -665,6 +667,140 @@ defmodule GRPC.Client.Adapters.Mint.ConnectionProcessTest do
     end
   end
 
+  # A server sends GOAWAY to retire a connection, e.g. SpiceDB/grpc-go once
+  # MaxConnectionAge is reached: streams up to last_stream_id are still
+  # answered, anything later was never processed and no new streams are
+  # accepted. In-flight requests must not fail just because of that.
+  describe "handle_info - GOAWAY" do
+    setup :goaway_connection
+    setup :valid_stream_request
+    setup :valid_stream_response
+    setup :attach_goaway_telemetry
+
+    test "moves to a new connection and keeps in-flight requests draining on the old one",
+         %{state: state, request_ref: request_ref, stream_response_pid: response_pid} do
+      old_socket = state.conn.socket
+      stream_id = state.conn.next_stream_id - 2
+
+      assert {:noreply, new_state} =
+               ConnectionProcess.handle_info(goaway(old_socket, stream_id), state)
+
+      # new requests go to a fresh, writable connection
+      assert new_state.conn.socket != old_socket
+      assert Mint.HTTP.open?(new_state.conn, :write)
+      assert_receive {:accepted, 2}, 1_000
+
+      # the in-flight request is kept, waiting for its answer
+      assert Map.has_key?(new_state.requests, request_ref)
+      assert map_size(new_state.draining) == 1
+      refute :sys.get_state(response_pid).done
+      refute_received {:elixir_grpc, :connection_down, _pid}
+
+      assert_received {:telemetry, [:grpc, :client, :mint, :goaway], %{in_flight: 1},
+                       %{reconnected: true, error_code: :no_error}}
+    end
+
+    test "delivers the answer of a draining request and then closes the old connection",
+         %{state: state, request_ref: request_ref, stream_response_pid: response_pid} do
+      old_socket = state.conn.socket
+      stream_id = state.conn.next_stream_id - 2
+
+      {:noreply, state} = ConnectionProcess.handle_info(goaway(old_socket, stream_id), state)
+
+      # HEADERS(:status 200) with END_STREAM: the server finished the request
+      assert {:noreply, new_state} =
+               ConnectionProcess.handle_info({:tcp, old_socket, ok_response(stream_id)}, state)
+
+      response_state = :sys.get_state(response_pid)
+      assert response_state.done
+      refute Enum.any?(:queue.to_list(response_state.responses), &match?({:error, _}, &1))
+
+      refute Map.has_key?(new_state.requests, request_ref)
+      assert new_state.draining == %{}
+    end
+
+    test "fails requests the server never processed as UNAVAILABLE so they can be retried",
+         %{state: state, request_ref: request_ref, stream_response_pid: response_pid} do
+      # last_stream_id 0: our request was not processed
+      assert {:noreply, new_state} =
+               ConnectionProcess.handle_info(goaway(state.conn.socket, 0), state)
+
+      refute Map.has_key?(new_state.requests, request_ref)
+
+      assert [error: %GRPC.RPCError{status: status}] =
+               :queue.to_list(:sys.get_state(response_pid).responses)
+
+      assert status == GRPC.Status.unavailable()
+    end
+
+    test "sends new requests on the new connection",
+         %{state: state, request: {method, path, headers}} do
+      stream_id = state.conn.next_stream_id - 2
+
+      {:noreply, state} =
+        ConnectionProcess.handle_info(goaway(state.conn.socket, stream_id), state)
+
+      request = {:request, method, path, headers, :stream, [stream_response_pid: self()]}
+
+      assert {:reply, {:ok, %{request_ref: new_ref}}, new_state} =
+               ConnectionProcess.handle_call(request, nil, state)
+
+      assert Map.has_key?(new_state.conn.ref_to_stream_id, new_ref)
+    end
+
+    test "fails only its own requests when a draining connection drops",
+         %{state: state, request_ref: request_ref, stream_response_pid: response_pid} do
+      old_socket = state.conn.socket
+      stream_id = state.conn.next_stream_id - 2
+      {:noreply, state} = ConnectionProcess.handle_info(goaway(old_socket, stream_id), state)
+
+      assert {:noreply, new_state} =
+               ConnectionProcess.handle_info({:tcp_closed, old_socket}, state)
+
+      assert [error: %GRPC.RPCError{status: status, message: "the connection is closed"}] =
+               :queue.to_list(:sys.get_state(response_pid).responses)
+
+      assert status == GRPC.Status.unavailable()
+      refute Map.has_key?(new_state.requests, request_ref)
+      assert new_state.draining == %{}
+
+      # the active connection is untouched and nobody is told it went down
+      assert Mint.HTTP.open?(new_state.conn, :write)
+      refute_received {:elixir_grpc, :connection_down, _pid}
+    end
+  end
+
+  describe "handle_info - GOAWAY - cannot reconnect" do
+    setup :single_use_goaway_connection
+    setup :valid_stream_request
+    setup :valid_stream_response
+    setup :attach_goaway_telemetry
+
+    test "keeps draining in-flight requests and fails new ones as UNAVAILABLE",
+         %{state: state, request_ref: request_ref, request: {method, path, headers}} = ctx do
+      stream_id = state.conn.next_stream_id - 2
+      assert_receive {:accepted, 1}, 1_000
+
+      {result, _log} =
+        with_log(fn ->
+          ConnectionProcess.handle_info(goaway(state.conn.socket, stream_id), state)
+        end)
+
+      assert {:noreply, state} = result
+      assert Map.has_key?(state.requests, request_ref)
+      refute :sys.get_state(ctx.stream_response_pid).done
+
+      request = {:request, method, path, headers, :stream, [stream_response_pid: self()]}
+
+      assert {:reply, {:error, %GRPC.RPCError{status: status}}, _state} =
+               ConnectionProcess.handle_call(request, nil, state)
+
+      assert status == GRPC.Status.unavailable()
+
+      assert_received {:telemetry, [:grpc, :client, :mint, :goaway], _, %{reconnected: false}}
+    end
+  end
+
   describe "handle_info - non-200 responses" do
     setup :quiet_connection
     setup :valid_stream_request
@@ -886,6 +1022,93 @@ defmodule GRPC.Client.Adapters.Mint.ConnectionProcessTest do
       port: port,
       request: {"POST", "/routeguide.RouteGuide/RecordRoute", headers}
     }
+  end
+
+  # A bare HTTP/2 server like quiet_connection/1, but one that accepts any
+  # number of connections (so the client can reconnect after a GOAWAY) and
+  # reports each accept to the test as {:accepted, count}.
+  defp goaway_connection(_ctx), do: start_quiet_server(:infinity)
+
+  # Accepts the first connection only, then stops listening, so a reconnect
+  # attempted after the GOAWAY fails.
+  defp single_use_goaway_connection(_ctx), do: start_quiet_server(1)
+
+  defp start_quiet_server(max_accepts) do
+    {:ok, listen_socket} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen_socket)
+    test_pid = self()
+
+    spawn_link(fn -> quiet_accept_loop(listen_socket, test_pid, max_accepts, 1) end)
+    on_exit(fn -> :gen_tcp.close(listen_socket) end)
+
+    {:ok, pid} = ConnectionProcess.start_link(:http, "localhost", port, protocols: [:http2])
+    wait_until_open(pid)
+
+    state = :sys.get_state(pid)
+    version = Application.spec(:grpc) |> Keyword.get(:vsn)
+
+    headers = [
+      {"content-type", "application/grpc"},
+      {"user-agent", "grpc-elixir/#{version}"},
+      {"te", "trailers"}
+    ]
+
+    %{
+      process_pid: pid,
+      state: state,
+      port: port,
+      request: {"POST", "/routeguide.RouteGuide/RecordRoute", headers}
+    }
+  end
+
+  defp quiet_accept_loop(listen_socket, test_pid, max_accepts, count) do
+    case :gen_tcp.accept(listen_socket) do
+      {:ok, socket} ->
+        :ok = :gen_tcp.send(socket, <<0::24, 0x04, 0, 0::32>>)
+        :ok = :gen_tcp.send(socket, <<0::24, 0x04, 0x01, 0::32>>)
+        send(test_pid, {:accepted, count})
+
+        if max_accepts != :infinity and count >= max_accepts do
+          :gen_tcp.close(listen_socket)
+
+          # keep the accepted socket open until the test process exits
+          receive do
+            :close -> :gen_tcp.close(socket)
+          end
+        else
+          quiet_accept_loop(listen_socket, test_pid, max_accepts, count + 1)
+        end
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  # GOAWAY frame: length 8, type 0x7, flags 0, stream 0; payload: last stream id
+  # (with the reserved bit) and error code 0 (NO_ERROR).
+  defp goaway(socket, last_stream_id) do
+    {:tcp, socket, <<8::24, 0x07, 0, 0::32, 0::1, last_stream_id::31, 0::32>>}
+  end
+
+  # HEADERS frame with END_STREAM | END_HEADERS carrying only `:status 200`
+  # (static table index 8): the server answered and finished the stream.
+  defp ok_response(stream_id), do: <<1::24, 0x01, 0x05, stream_id::32, 0x88>>
+
+  defp attach_goaway_telemetry(_ctx) do
+    test_pid = self()
+    handler_id = "test-goaway-telemetry-#{inspect(test_pid)}"
+
+    :telemetry.attach(
+      handler_id,
+      [:grpc, :client, :mint, :goaway],
+      fn name, measurements, metadata, [] ->
+        send(test_pid, {:telemetry, name, measurements, metadata})
+      end,
+      []
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    :ok
   end
 
   defp wait_until_open(pid, attempts_left \\ 100) do

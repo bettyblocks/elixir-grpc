@@ -13,7 +13,13 @@ if Code.ensure_loaded?(Mint.HTTP) do
       requests: %{},
       request_stream_queue: :queue.new(),
       retry: 0,
-      retry_attempt: 0
+      retry_attempt: 0,
+      # Connections the server retired with a GOAWAY, keyed by an id, kept
+      # until the requests still in flight on them are answered.
+      draining: %{},
+      # Set when the server sent a GOAWAY but opening a replacement failed:
+      # `conn` keeps draining and the regular reconnect runs once it closes.
+      draining_in_place: false
     ]
 
     def new(conn, opts) do
@@ -44,8 +50,27 @@ if Code.ensure_loaded?(Mint.HTTP) do
       put_in(state.requests[ref], %{
         stream_response_pid: response_pid,
         done: false,
-        response: %{}
+        response: %{},
+        conn_id: :active
       })
+    end
+
+    @doc """
+    Which connection a request runs on: `:active` (`state.conn`) or the id of
+    a draining connection in `state.draining`.
+    """
+    def conn_id(state, ref), do: Map.get(state.requests[ref], :conn_id, :active)
+
+    @doc "The refs of the requests running on the given connection."
+    def refs_on(state, conn_id) do
+      for {ref, request} <- state.requests,
+          Map.get(request, :conn_id, :active) == conn_id,
+          do: ref
+    end
+
+    @doc "Record that the given requests now run on connection `conn_id`."
+    def move_requests(state, refs, conn_id) do
+      Enum.reduce(refs, state, fn ref, acc -> put_in(acc.requests[ref][:conn_id], conn_id) end)
     end
 
     def update_response_status(state, ref, status) do
