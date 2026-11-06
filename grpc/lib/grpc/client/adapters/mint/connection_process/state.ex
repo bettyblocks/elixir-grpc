@@ -22,7 +22,14 @@ if Code.ensure_loaded?(Mint.HTTP) do
       settings_known?: false,
       pings_unacked: 0,
       notify_drain: false,
-      draining: false
+      draining: false,
+      # Connections the server retired with a GOAWAY, keyed by an id, kept
+      # until the requests still in flight on them are answered. New requests
+      # already go to `conn`, a connection opened when the GOAWAY arrived.
+      retired: %{},
+      # Set when the server sent a GOAWAY but opening a replacement failed:
+      # `conn` keeps draining and the regular reconnect runs once it closes.
+      draining_in_place: false
     ]
 
     def new(conn, opts) do
@@ -58,8 +65,33 @@ if Code.ensure_loaded?(Mint.HTTP) do
         stream_response_pid: response_pid,
         monitor_ref: monitor_ref,
         done: false,
-        response: %{}
+        response: %{},
+        conn_id: :active
       })
+    end
+
+    @doc """
+    Which connection a request runs on: `:active` (`state.conn`) or the id of
+    a retired connection in `state.retired`. A request that is gone counts as
+    `:active`.
+    """
+    def conn_id(state, ref) do
+      case state.requests do
+        %{^ref => request} -> Map.get(request, :conn_id, :active)
+        _requests -> :active
+      end
+    end
+
+    @doc "The refs of the requests running on the given connection."
+    def refs_on(state, conn_id) do
+      for {ref, request} <- state.requests,
+          Map.get(request, :conn_id, :active) == conn_id,
+          do: ref
+    end
+
+    @doc "Record that the given requests now run on connection `conn_id`."
+    def move_requests(state, refs, conn_id) do
+      Enum.reduce(refs, state, fn ref, acc -> put_in(acc.requests[ref][:conn_id], conn_id) end)
     end
 
     def find_request_ref_by_monitor_ref(state, monitor_ref) do

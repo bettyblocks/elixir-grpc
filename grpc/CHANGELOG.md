@@ -8,6 +8,7 @@
 
 ### Bug Fixes
 
+  * After a GOAWAY, the Mint connection process opens a new connection at once and sends new calls there, while the calls in flight finish on the old one. Calls that start during the drain no longer fail with UNAVAILABLE, with or without the pool. Streams the server never processed (above the GOAWAY's last stream id) fail with UNAVAILABLE. If the new connection cannot be opened, the old behavior applies: the pool is told the connection is draining. Emits `[:grpc, :client, :mint, :goaway]` with `in_flight`, `error_code` and `reconnected`.
   * The Mint adapter no longer leaks a `StreamResponseProcess` when the call to the connection process exits, because the process is gone, dies during the call, or takes longer than the call timeout.
 
 ## v1.1.0 - 2026-11-13

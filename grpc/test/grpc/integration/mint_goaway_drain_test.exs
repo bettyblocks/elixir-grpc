@@ -1,7 +1,7 @@
 defmodule GRPC.Integration.MintGoawayDrainTest do
-  # The Mint client after a server GOAWAY (`:max_connection_age` on the server):
-  # with the pool, new calls go to a new connection while open calls finish on the old
-  # one. Without the pool, new calls fail until the drain ends.
+  # The Mint client after a server GOAWAY (`:max_connection_age` on the server): the
+  # connection process opens a new connection at once and sends new calls there, while
+  # open calls finish on the old one. This works the same with and without the pool.
   # async: false, because it toggles `:pool_enabled` and uses global telemetry handlers.
   use GRPC.Integration.TestCase, async: false
 
@@ -63,13 +63,13 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
     end)
   end
 
-  describe "with the pool" do
-    setup do
-      Application.put_env(:grpc, :pool_enabled, true)
-    end
+  for pool <- [true, false], retry <- [0, 3] do
+    describe "pool_enabled: #{pool}, retry: #{retry}" do
+      setup do
+        Application.put_env(:grpc, :pool_enabled, unquote(pool))
+      end
 
-    for retry <- [0, 3] do
-      test "a call that starts in the drain uses a new connection, and the old one leaves (retry: #{retry})" do
+      test "a call that starts in the drain uses a new connection, and the open call finishes on the old one" do
         run_server(
           DrainServer,
           fn port ->
@@ -82,7 +82,7 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
                 adapter_opts: [retry: unquote(retry)]
               )
 
-            old = assert_connected(ref)
+            transport = assert_connected(ref)
 
             task =
               Task.async(fn ->
@@ -90,33 +90,35 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
               end)
 
             assert_receive {:in_flight, rpc}, @ceiling
+            [old_server_conn] = :ranch.procs(inspect(DrainServer), :connections)
+            server_ref = Process.monitor(old_server_conn)
 
-            # The pool opens the replacement when the old connection reports the drain.
-            new = assert_connected(ref)
-            assert new != old
-            assert [%{draining: true}, %{draining: false}] = sorted_channels(channel, old)
+            # The same connection process opens the replacement when the GOAWAY arrives.
+            assert_handed_over(ref, transport)
 
             assert {:ok, %Routeguide.Feature{name: "quick"}} =
                      Routeguide.RouteGuide.Stub.get_feature(channel, point(2), timeout: @ceiling)
 
-            assert_receive {:telemetry, [:grpc, :client, :transport, :streams], %{active: 1},
-                            %{logical_connection_ref: ^ref, transport_ref: ^new}}
+            if unquote(pool) do
+              assert [%{draining: false, channel: %{adapter_payload: %{conn_pid: ^transport}}}] =
+                       channels(channel)
+            end
 
             assert Process.alive?(rpc)
+            refute_received {:DOWN, ^server_ref, :process, ^old_server_conn, _}
             send(rpc, :release)
             assert {:ok, %Routeguide.Feature{name: "released"}} = Task.await(task, @ceiling)
 
-            assert_receive {:telemetry, [:grpc, :client, :transport, :stopped], _,
-                            %{logical_connection_ref: ^ref, transport_ref: ^old}},
-                           @ceiling
+            # The client closes the old connection once its last call is answered.
+            assert_receive {:DOWN, ^server_ref, :process, ^old_server_conn, _}, @ceiling
 
-            assert [%{draining: false, channel: %{adapter_payload: %{conn_pid: ^new}}}] =
-                     channels(channel)
-
-            # The old connection does not reconnect, and the pool opens no third one.
-            refute_receive {:telemetry, [:grpc, :client, :transport, :connected], _,
+            # Nothing went down: no stop, and no further connection.
+            refute_receive {:telemetry, [:grpc, :client, :transport, :stopped], _,
                             %{logical_connection_ref: ^ref}},
                            300
+
+            refute_received {:telemetry, [:grpc, :client, :transport, :connected], _,
+                             %{logical_connection_ref: ^ref}}
 
             GRPC.Stub.disconnect(channel)
           end,
@@ -124,6 +126,12 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
           @server_opts
         )
       end
+    end
+  end
+
+  describe "with the pool" do
+    setup do
+      Application.put_env(:grpc, :pool_enabled, true)
     end
 
     test "a client-streaming call cannot send in the drain, and fails with UNAVAILABLE" do
@@ -135,7 +143,7 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
           {:ok, channel} =
             GRPC.Stub.connect("127.0.0.1:#{port}", name: ref, adapter: @adapter)
 
-          old = assert_connected(ref)
+          transport = assert_connected(ref)
 
           stream = Routeguide.RouteGuide.Stub.record_route(channel, timeout: 10_000)
           stream = GRPC.Stub.send_request(stream, point(1))
@@ -143,7 +151,7 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
           [old_server_conn] = :ranch.procs(inspect(DrainServer), :connections)
           server_ref = Process.monitor(old_server_conn)
 
-          assert assert_connected(ref) != old
+          assert_handed_over(ref, transport)
 
           stream = GRPC.Stub.send_request(stream, point(2))
           stream = GRPC.Stub.end_stream(stream)
@@ -151,10 +159,6 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
           assert {:error, %GRPC.RPCError{status: 14}} = GRPC.Stub.recv(stream)
 
           # Without the cancel, the call stays open until `:max_connection_age_grace`.
-          assert_receive {:telemetry, [:grpc, :client, :transport, :stopped], _,
-                          %{logical_connection_ref: ^ref, transport_ref: ^old}},
-                         @ceiling
-
           assert_receive {:DOWN, ^server_ref, :process, ^old_server_conn, _}, @ceiling
 
           assert {:ok, %Routeguide.Feature{name: "quick"}} =
@@ -259,55 +263,6 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
     end
   end
 
-  describe "without the pool" do
-    setup do
-      Application.put_env(:grpc, :pool_enabled, false)
-    end
-
-    for retry <- [0, 3] do
-      test "a call in the drain fails, and the client connects again after it (retry: #{retry})" do
-        run_server(
-          DrainServer,
-          fn port ->
-            ref = make_ref()
-
-            {:ok, channel} =
-              GRPC.Stub.connect("127.0.0.1:#{port}",
-                name: ref,
-                adapter: @adapter,
-                adapter_opts: [retry: unquote(retry)]
-              )
-
-            old = assert_connected(ref)
-
-            task =
-              Task.async(fn ->
-                Routeguide.RouteGuide.Stub.get_feature(channel, point(1), timeout: 10_000)
-              end)
-
-            assert_receive {:in_flight, rpc}, @ceiling
-            await_goaway(old)
-
-            assert {:error, %GRPC.RPCError{status: 14}} =
-                     Routeguide.RouteGuide.Stub.get_feature(channel, point(2), timeout: @ceiling)
-
-            send(rpc, :release)
-            assert {:ok, %Routeguide.Feature{name: "released"}} = Task.await(task, @ceiling)
-
-            assert_connected(ref)
-
-            # The channel list is not ready yet when the transport reports `:connected`.
-            assert {:ok, %Routeguide.Feature{name: "quick"}} = get_feature_when_ready(channel)
-
-            GRPC.Stub.disconnect(channel)
-          end,
-          0,
-          @server_opts
-        )
-      end
-    end
-  end
-
   defp point(latitude), do: %Routeguide.Point{latitude: latitude, longitude: 0}
 
   defp assert_connected(ref) do
@@ -318,29 +273,18 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
     transport_ref
   end
 
+  # The connection process reconnected in place: same process, next generation.
+  defp assert_handed_over(ref, transport) do
+    assert_receive {:telemetry, [:grpc, :client, :transport, :connected], %{generation: 2},
+                    %{logical_connection_ref: ^ref, transport_ref: ^transport, reconnect: true}},
+                   @ceiling
+  end
+
   defp channels(channel) do
     [{pool, _}] =
       Registry.lookup(GRPC.Client.Pool.Registry, {GRPC.Client.Pool.Server, channel.pool})
 
     pool |> :sys.get_state() |> Map.fetch!(:channels) |> Map.values()
-  end
-
-  # The draining channel first.
-  defp sorted_channels(channel, old_conn_pid) do
-    Enum.sort_by(channels(channel), fn %{channel: %{adapter_payload: %{conn_pid: pid}}} ->
-      pid != old_conn_pid
-    end)
-  end
-
-  defp get_feature_when_ready(channel, attempts \\ 100) do
-    case Routeguide.RouteGuide.Stub.get_feature(channel, point(2), timeout: @ceiling) do
-      {:error, %GRPC.RPCError{status: 14}} when attempts > 0 ->
-        Process.sleep(20)
-        get_feature_when_ready(channel, attempts - 1)
-
-      result ->
-        result
-    end
   end
 
   defp send_queued?(pid) do
@@ -360,21 +304,6 @@ defmodule GRPC.Integration.MintGoawayDrainTest do
       true ->
         Process.sleep(10)
         await_until(check, deadline)
-    end
-  end
-
-  # There is no event for this: the pool is off, so the process sends no drain message.
-  defp await_goaway(conn_pid, deadline \\ System.monotonic_time(:millisecond) + @ceiling) do
-    cond do
-      not Mint.HTTP.open?(:sys.get_state(conn_pid).conn) ->
-        :ok
-
-      System.monotonic_time(:millisecond) > deadline ->
-        flunk("the client never saw GOAWAY")
-
-      true ->
-        Process.sleep(10)
-        await_goaway(conn_pid, deadline)
     end
   end
 end

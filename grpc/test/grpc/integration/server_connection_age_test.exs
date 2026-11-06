@@ -74,10 +74,17 @@ defmodule GRPC.Integration.ServerConnectionAgeTest do
             assert {:ok, %Routeguide.Feature{name: "released"}} = Task.await(task, @ceiling)
             assert_receive {:DOWN, ^ref, :process, ^old_conn, _}, @ceiling
 
-            # The client replaces the closed connection in the background. A call made
-            # before that can fail, because it has no live connection.
-            assert_receive {:transport, :down}, @ceiling
-            assert_receive {:transport, :connected}, @ceiling
+            if unquote(name) == :gun do
+              # Gun replaces the closed connection in the background. A call made
+              # before that can fail, because it has no live connection.
+              assert_receive {:transport, :down}, @ceiling
+              assert_receive {:transport, :connected}, @ceiling
+            else
+              # Mint opened the new connection when the GOAWAY arrived, so nothing
+              # went down.
+              assert_receive {:transport, :connected}, @ceiling
+              refute_received {:transport, :down}
+            end
 
             assert {:ok, %Routeguide.Feature{name: "quick"}} =
                      Routeguide.RouteGuide.Stub.get_feature(channel, point(2), timeout: @ceiling)
